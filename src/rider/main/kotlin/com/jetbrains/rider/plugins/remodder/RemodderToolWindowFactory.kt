@@ -3,15 +3,15 @@ package com.jetbrains.rider.plugins.remodder
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
-import com.intellij.diff.util.DiffUserDataKeys
+import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.TextEditor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogBuilder
 import com.intellij.openapi.ui.Messages
-import com.intellij.openapi.ui.Messages.InputDialog
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
 import com.intellij.psi.impl.source.tree.LeafPsiElement
@@ -31,7 +31,6 @@ import com.jetbrains.rider.languages.fileTypes.csharp.psi.impl.CSharpDummyDeclar
 import com.jetbrains.rider.languages.fileTypes.csharp.psi.impl.CSharpNamespaceFileScopeHeader
 import com.jetbrains.rider.plugins.rdprotocol.remodderProtocolModel
 import com.jetbrains.rider.projectView.solution
-import com.jetbrains.rider.util.idea.getService
 import java.awt.BorderLayout
 import java.awt.FlowLayout
 import javax.swing.JButton
@@ -52,28 +51,41 @@ class RemodderToolWindowFactory : ToolWindowFactory {
         errorDetails.isVisible = false
 
         refresh.addActionListener {
-            val userAssemblies = project.getService<RemodderStateComponent>().state.userAssemblies
+            val userAssemblies = project.getService(RemodderStateComponent::class.java).state.userAssemblies
             val editor = (FileEditorManager.getInstance(project).selectedEditor as TextEditor).editor
-            val view = PsiManager.getInstance(project).findViewProvider(editor.virtualFile)
+            val virtualFile = editor.virtualFile ?: return@addActionListener
+            val view = PsiManager.getInstance(project).findViewProvider(virtualFile)
             val el = view?.findElementAt(editor.caretModel.offset) ?: return@addActionListener
 
-            val filePath = editor.virtualFile.path
-            val typeName = namespaceAndClassOfElement(el) ?: "<null>"
+            val filePath = virtualFile.path
+            var typeNameResult: String? = null
+            ApplicationManager.getApplication().runReadAction { typeNameResult = namespaceAndClassOfElement(el) }
+            val typeName = typeNameResult ?: "<null>"
+
+            //TODO: remove extensive logging
+            thisLogger().info("Refresh clicked: typeName=$typeName, filePath=$filePath")
+            thisLogger().info("  virtualFile.name=${virtualFile.name}")
+            thisLogger().info("  virtualFile.url=${virtualFile.url}")
+            thisLogger().info("  virtualFile.canonicalPath=${virtualFile.canonicalPath}")
+            thisLogger().info("  virtualFile.presentableUrl=${virtualFile.presentableUrl}")
+            thisLogger().info("  virtualFile.isInLocalFileSystem=${virtualFile.isInLocalFileSystem}")
+            thisLogger().info("  filePath.isEmpty=${filePath.isEmpty()}")
+            thisLogger().info("  fileExists=${java.io.File(filePath).exists()}")
+            thisLogger().info("  userAssemblies (${userAssemblies.size}): ${userAssemblies.joinToString(", ").ifEmpty { "<none>" }}")
 
             statusLabel.text = "$typeName..."
             errorDetails.isVisible = false
 
             project.solution.remodderProtocolModel.decompile.start(arrayOf(filePath, typeName) + userAssemblies).toPromise().then {
-                if (it.size == 1)
-                {
+                thisLogger().info("Decompile RPC returned ${it.size} strings")
+                if (it.size == 1) {
                     statusLabel.text = "$typeName: ${it[0]}"
                     errorDetails.isVisible = false
                     return@then
                 }
 
-                val content1 = DiffContentFactory.getInstance().create(project, it[0], editor.virtualFile)
-                val content2 = DiffContentFactory.getInstance().create(project, it[1], editor.virtualFile)
-                content2.putUserData(DiffUserDataKeys.FORCE_READ_ONLY, true)
+                val content1 = DiffContentFactory.getInstance().create(project, it[0], virtualFile)
+                val content2 = DiffContentFactory.getInstance().create(project, it[1], virtualFile)
 
                 val request = SimpleDiffRequest("Original/Transpiled", content1, content2, "Original", "Transpiled")
                 diffPanel.setRequest(request)
@@ -81,6 +93,7 @@ class RemodderToolWindowFactory : ToolWindowFactory {
                 statusLabel.text = typeName
                 errorDetails.isVisible = false
             }.onError {
+                thisLogger().error("Decompile RPC failed", it)
                 errorMsg = it.toString()
                 statusLabel.text = "$typeName: ERROR"
                 errorDetails.isVisible = true
@@ -98,7 +111,7 @@ class RemodderToolWindowFactory : ToolWindowFactory {
         }
 
         showUserAssemblies.addActionListener {
-            val userAssemblies = project.getService<RemodderStateComponent>().state.userAssemblies
+            val userAssemblies = project.getService(RemodderStateComponent::class.java).state.userAssemblies
             val listModel = CollectionListModel(userAssemblies, true)
             val jbList = JBList(listModel)
 
@@ -132,7 +145,6 @@ class RemodderToolWindowFactory : ToolWindowFactory {
     }
 
     private fun namespaceAndClassOfElement(psiElement: PsiElement): String? {
-        // Simple heuristics to get <namespace>.<class> of code under caret
         val nsDecl = psiElement.parentOfType<CSharpNamespaceDeclaration>()
         var nsIdent = nsDecl?.childrenOfType<CSharpDeclarationIdentifier>()?.firstOrNull()
 
