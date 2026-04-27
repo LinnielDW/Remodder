@@ -103,10 +103,18 @@ class RemodderToolWindowFactory : ToolWindowFactory {
 
         errorDetails.addActionListener {
             val errorTextArea = JTextArea()
-            errorTextArea.text = errorMsg
+            errorTextArea.text = buildString {
+                appendLine(errorMsg)
+                appendLine()
+                appendLine("If this looks like a bug, please report it at:")
+                appendLine("https://github.com/LinnielDW/Remodder/issues")
+            }
             errorTextArea.isEditable = false
+            errorTextArea.lineWrap = true
+            errorTextArea.wrapStyleWord = true
 
             val dialogBuilder = DialogBuilder(project)
+            dialogBuilder.setTitle("Remodder Error")
             dialogBuilder.setCenterPanel(errorTextArea)
             dialogBuilder.show()
         }
