@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -15,8 +16,6 @@ using Mono.Cecil;
 using Mono.Cecil.Cil;
 using MonoMod.Utils;
 
-// Taken from my old TranspilerExplorer project
-// Badly needs a rework...
 namespace Remodder.Common;
 
 public static class Decompiler
@@ -45,12 +44,12 @@ public static class Decompiler
         using var writer = new StringWriter();
 
         var assemblyResolver = new UniversalAssemblyResolver(
-            userAsms.FirstOrDefault(), 
-            false, 
-            peFile.DetectTargetFrameworkId(), 
+            userAsms.FirstOrDefault(),
+            false,
+            peFile.DetectTargetFrameworkId(),
             peFile.DetectRuntimePack()
         );
-        
+
         foreach (var userAsm in userAsms.Skip(1))
         {
             var dir = Path.GetDirectoryName(userAsm);
@@ -64,7 +63,7 @@ public static class Decompiler
             AnonymousMethods = false,
             UseDebugSymbols = debugInfo != null
         };
-            
+
         var decompiler = new CSharpDecompiler(peFile, assemblyResolver, settings)
         {
             DebugInfoProvider = debugInfo,
@@ -96,7 +95,12 @@ public static class Decompiler
     {
         var patch = MethodPatcher.CreateDynamicMethod(orig, "", false);
         var il = patch.GetILGenerator();
-        var originalVariables = MethodPatcher.DeclareOriginalLocalVariables(il, orig);
+
+        // On .NET 9+, CecilILGenerator.DeclareLocal crashes because LocalBuilder is abstract.
+        // Fix: try the normal path first, fall back to declaring locals on the Cecil body directly
+        // and returning real LocalBuilders from a side DynamicMethod for MethodCopier compatibility.
+        var originalVariables = DeclareLocalVariablesSafe(il, orig);
+
         var copier = new MethodCopier(orig, il, originalVariables);
         var emitter = new Emitter(il, false);
 
@@ -132,6 +136,82 @@ public static class Decompiler
         GenerateCecilMethod(patch, typeDef);
 
         module.Write(stream);
+    }
+
+    /// <summary>
+    /// Declares local variables for the original method, working around the .NET 9+ issue
+    /// where LocalBuilder is abstract and CecilILGenerator.DeclareLocal fails.
+    ///
+    /// Strategy: try the normal Harmony path first. If it fails, declare the locals directly
+    /// on the Cecil MethodBody (via reflection into CecilILGenerator) and return real
+    /// LocalBuilders from a side DynamicMethod for MethodCopier compatibility.
+    /// </summary>
+    static LocalBuilder[] DeclareLocalVariablesSafe(ILGenerator il, MethodBase orig)
+    {
+        // Try the normal path first — works on .NET 8 and earlier
+        try
+        {
+            return MethodPatcher.DeclareOriginalLocalVariables(il, orig);
+        }
+        catch
+        {
+            // .NET 9+: CecilILGenerator.DeclareLocal throws because LocalBuilder is abstract
+        }
+
+        var methodBody = orig.GetMethodBody();
+        if (methodBody == null)
+            return [];
+
+        var locals = methodBody.LocalVariables;
+
+        // Create real LocalBuilders from a side DynamicMethod (these work on any .NET version)
+        var sideDm = new DynamicMethod("__locals", typeof(void), Type.EmptyTypes);
+        var sideIl = sideDm.GetILGenerator();
+        var localBuilders = locals
+            .Select(lvi => sideIl.DeclareLocal(lvi.LocalType, lvi.IsPinned))
+            .ToArray();
+
+        // Declare the variables directly on the Cecil body that backs the CecilILGenerator.
+        var cecilBody = FindFieldValue<Mono.Cecil.Cil.MethodBody>(il, depth: 6);
+        if (cecilBody != null)
+        {
+            var cecilModule = cecilBody.Method.Module;
+            var locsDict = FindFieldValue<Dictionary<LocalBuilder, VariableDefinition>>(il, depth: 6);
+
+            for (int i = 0; i < locals.Count; i++)
+            {
+                var varDef = new VariableDefinition(cecilModule.ImportReference(locals[i].LocalType));
+                cecilBody.Variables.Add(varDef);
+                locsDict?.TryAdd(localBuilders[i], varDef);
+            }
+        }
+
+        return localBuilders;
+    }
+
+    /// <summary>
+    /// Searches an object graph (via reflection) for a field of the specified type, up to a given depth.
+    /// </summary>
+    static T? FindFieldValue<T>(object obj, int depth) where T : class
+    {
+        if (depth == 0 || obj == null) return null;
+        var bf = BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance;
+        foreach (var f in obj.GetType().GetFields(bf))
+        {
+            if (f.FieldType.IsValueType || f.FieldType == typeof(string)) continue;
+            try
+            {
+                var val = f.GetValue(obj);
+                if (val is T match) return match;
+                if (val != null)
+                {
+                    var found = FindFieldValue<T>(val, depth - 1);
+                    if (found != null) return found;
+                }
+            }
+            catch { }
+        }
+        return null;
     }
 
     // Copied from MonoMod.Utils.DMDCecilGenerator, edited to not load the assembly
