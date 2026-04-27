@@ -10,7 +10,6 @@ using ICSharpCode.Decompiler.DebugInfo;
 using ICSharpCode.Decompiler.Disassembler;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
-using HarmonyLib;
 
 namespace Remodder.Common;
 
@@ -19,25 +18,32 @@ public static class Decompiler
     internal const string OrigType = "OrigType";
     const string DummyDll = "decomp.dll";
 
-    public static AttributePatch? GetTranspiler(Assembly asm, string typeName)
+    /// <summary>
+    /// Discovers the transpiler and its target for the given type. Delegates to <see cref="TranspilerResolver"/>.
+    /// </summary>
+    public static TranspilerInfo? GetTranspilerInfo(Assembly asm, string typeName)
+        => TranspilerResolver.Resolve(asm, typeName);
+
+
+    public static string Decompile(MethodBase orig, MethodInfo? transpiler, string[] userAsms, IDebugInfoProvider? debugInfo, MethodBase? asyncOuterMethod = null, string? asyncAssemblyPath = null)
     {
-        var type = asm.GetType(typeName);
-        if (type == null)
-            return null;
-        var transpiler = new Harmony("dummy").
-            CreateClassProcessor(type).patchMethods?.
-            FirstOrDefault(p => p.type == HarmonyPatchType.Transpiler);
-        return transpiler;
+        try
+        {
+            return DecompileInternal(orig, transpiler, userAsms, debugInfo, anonymousMethods: true, asyncOuterMethod: asyncOuterMethod, asyncAssemblyPath: asyncAssemblyPath);
+        }
+        catch
+        {
+            return DecompileInternal(orig, transpiler, userAsms, debugInfo, anonymousMethods: false, asyncOuterMethod: asyncOuterMethod, asyncAssemblyPath: asyncAssemblyPath);
+        }
     }
 
-    public static string Decompile(MethodBase orig, MethodInfo? transpiler, string[] userAsms, IDebugInfoProvider? debugInfo)
+    private static string DecompileInternal(MethodBase orig, MethodInfo? transpiler, string[] userAsms, IDebugInfoProvider? debugInfo, bool anonymousMethods, MethodBase? asyncOuterMethod = null, string? asyncAssemblyPath = null)
     {
         using var stream = new MemoryStream();
-        HarmonyCecilAdapter.WriteAssembly(stream, orig, transpiler);
+        HarmonyCecilAdapter.WriteAssembly(stream, orig, transpiler, asyncOuterMethod, asyncAssemblyPath, userAsms);
         stream.Position = 0;
 
         using var peFile = new PEFile(DummyDll, stream);
-        using var writer = new StringWriter();
 
         var assemblyResolver = new UniversalAssemblyResolver(
             userAsms.FirstOrDefault(),
@@ -46,29 +52,48 @@ public static class Decompiler
             peFile.DetectRuntimePack()
         );
 
+        var existingDirs = new HashSet<string>(assemblyResolver.GetSearchDirectories(), StringComparer.OrdinalIgnoreCase);
         foreach (var userAsm in userAsms.Skip(1))
         {
             var dir = Path.GetDirectoryName(userAsm);
-            if (!string.IsNullOrEmpty(dir) && !assemblyResolver.GetSearchDirectories().Contains(dir))
-                assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(userAsm));
+            if (!string.IsNullOrEmpty(dir) && existingDirs.Add(dir))
+                assemblyResolver.AddSearchDirectory(dir);
         }
 
-        var settings = new DecompilerSettings
-        {
-            ThrowOnAssemblyResolveErrors = false,
-            AnonymousMethods = false,
-            UseDebugSymbols = debugInfo != null
-        };
+        var settings = CreateDecompilerSettings(anonymousMethods, useDebugSymbols: debugInfo != null);
 
         var decompiler = new CSharpDecompiler(peFile, assemblyResolver, settings)
         {
             DebugInfoProvider = debugInfo,
         };
 
-        var code = decompiler.DecompileTypeAsString(new FullTypeName(orig.DeclaringType?.Name ?? OrigType));
+        // For async methods, decompile the outer type which contains the async method
+        var typeName = asyncOuterMethod != null
+            ? asyncOuterMethod.DeclaringType?.FullName ?? OrigType
+            : orig.DeclaringType?.Name ?? OrigType;
 
-        return code;
+        return decompiler.DecompileTypeAsString(new FullTypeName(typeName));
     }
+
+    private static DecompilerSettings CreateDecompilerSettings(bool anonymousMethods, bool useDebugSymbols) =>
+        new DecompilerSettings
+        {
+            ThrowOnAssemblyResolveErrors = false,
+            UseDebugSymbols = useDebugSymbols,
+            AnonymousMethods = anonymousMethods,
+            AsyncAwait = true,
+            YieldReturn = true,
+            SwitchStatementOnString = true,
+            ForEachStatement = true,
+            LockStatement = true,
+            UsingStatement = true,
+            PatternMatching = true,
+            StaticLocalFunctions = true,
+            NullPropagation = true,
+            StringInterpolation = true,
+            AggressiveScalarReplacementOfAggregates = true,
+        };
+
 
     public static string Disasm(MethodBase orig, MethodInfo transpiler)
     {

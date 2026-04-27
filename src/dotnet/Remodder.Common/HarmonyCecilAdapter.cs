@@ -52,8 +52,19 @@ public static class HarmonyCecilAdapter
     /// </summary>
     public static void WriteAssembly(Stream stream, MethodBase orig, MethodInfo? transpiler)
     {
-        var patch = MethodPatcherTools.CreateDynamicMethod(orig, "", false);
-        var il = patch.GetILGenerator();
+        WriteAssembly(stream, orig, transpiler, null, null);
+    }
+
+    /// <summary>
+    /// When <paramref name="asyncOuterMethod"/> is provided, reads the original assembly with Cecil,
+    /// copies the full declaring type (with all nested types including the state machine), and replaces
+    /// the MoveNext body with the transpiled version. This lets the decompiler reconstruct async/await.
+    /// </summary>
+    public static void WriteAssembly(Stream stream, MethodBase orig, MethodInfo? transpiler, MethodBase? asyncOuterMethod, string? asyncAssemblyPath, string[]? allAssemblyPaths = null)
+    {
+        // Build the transpiled MoveNext body via the normal DynamicMethod path
+        var dynamicMethod = MethodPatcherTools.CreateDynamicMethod(orig, "", false);
+        var il = dynamicMethod.GetILGenerator();
 
         var originalVariables = MethodPatcherTools.DeclareOriginalLocalVariables(il, orig);
 
@@ -65,11 +76,7 @@ public static class HarmonyCecilAdapter
         var endLabels = new List<Label>();
         var codeInstructions = copier.Finalize(false, out var hasReturnCode, out _, endLabels);
 
-        // Convert short branches to long branches to avoid range issues,
-        // same as Harmony's CleanupCodes does internally.
         codeInstructions = ExpandShortBranches(codeInstructions);
-
-        // Emit all instructions through the Emitter's CecilILGenerator.
         EmitCodesToCecil(emitter, codeInstructions);
 
         foreach (var label in endLabels)
@@ -78,7 +85,15 @@ public static class HarmonyCecilAdapter
         if (hasReturnCode)
             emitter.Emit(OpCodes.Ret);
 
-        string name = patch.GetDumpName("Cecil");
+        // If we have the async outer method, build a full-type assembly from the original
+        if (asyncOuterMethod != null && asyncAssemblyPath != null)
+        {
+            WriteAsyncAssembly(stream, orig, dynamicMethod, asyncOuterMethod, asyncAssemblyPath, allAssemblyPaths);
+            return;
+        }
+
+        // Non-async path: synthetic single-method assembly
+        string name = dynamicMethod.GetDumpName("Cecil");
         var module = ModuleDefinition.CreateModule(name, new ModuleParameters()
         {
             Kind = ModuleKind.Dll,
@@ -96,9 +111,245 @@ public static class HarmonyCecilAdapter
 
         module.Types.Add(typeDef);
 
-        GenerateCecilMethod(patch, typeDef);
+        GenerateCecilMethod(dynamicMethod, typeDef);
+
+        // Create stub nested types for any display classes / lambdas referenced
+        // from the method body, so the decompiler can resolve them.
+        CreateReferencedNestedTypeStubs(typeDef);
 
         module.Write(stream);
+    }
+
+    /// <summary>
+    /// Reads the original assembly, finds the state machine's MoveNext method, replaces its body
+    /// with the transpiled version, and writes the whole module to the output stream.
+    /// By modifying in-place (no cross-module cloning), we avoid Cecil import issues.
+    /// </summary>
+    private static void WriteAsyncAssembly(Stream stream, MethodBase moveNextMethod, DynamicMethodDefinition transpiledPatch, MethodBase asyncOuterMethod, string assemblyPath, string[]? allAssemblyPaths)
+    {
+        var outerType = asyncOuterMethod.DeclaringType!;
+
+        var resolver = new DefaultAssemblyResolver();
+        var assemblyDir = Path.GetDirectoryName(assemblyPath);
+        if (!string.IsNullOrEmpty(assemblyDir))
+            resolver.AddSearchDirectory(assemblyDir);
+
+        if (allAssemblyPaths != null)
+        {
+            var addedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (assemblyDir != null) addedDirs.Add(assemblyDir);
+            foreach (var path in allAssemblyPaths)
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && addedDirs.Add(dir))
+                    resolver.AddSearchDirectory(dir);
+            }
+        }
+
+        using var origModule = ModuleDefinition.ReadModule(assemblyPath, new ReaderParameters
+        {
+            ReadingMode = ReadingMode.Deferred,
+            AssemblyResolver = resolver
+        });
+
+        // Find the declaring type in the original module
+        var origTypeDef = origModule.Types.FirstOrDefault(t => t.FullName == outerType.FullName);
+        if (origTypeDef == null)
+            throw new InvalidOperationException($"Type {outerType.FullName} not found in assembly");
+
+        // Find the state machine type and its MoveNext method
+        var stateMachineTypeName = moveNextMethod.DeclaringType!.Name;
+        var stateMachineType = origTypeDef.NestedTypes.FirstOrDefault(t => t.Name == stateMachineTypeName);
+        if (stateMachineType == null)
+            throw new InvalidOperationException($"State machine type {stateMachineTypeName} not found");
+
+        var origMoveNext = stateMachineType.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+        if (origMoveNext == null)
+            throw new InvalidOperationException("MoveNext not found in state machine");
+
+        // Get the transpiled MoveNext body from the DynamicMethodDefinition
+        var transpiledDef = transpiledPatch.Definition;
+
+        // Clone the transpiled body onto the original MoveNext method
+        var newBody = transpiledDef.Body.Clone(origMoveNext);
+
+        // Relink references in the new body to the original module
+        foreach (var variable in newBody.Variables)
+        {
+            try { variable.VariableType = origModule.ImportReference(variable.VariableType); }
+            catch { }
+        }
+
+        foreach (var handler in newBody.ExceptionHandlers)
+            if (handler.CatchType != null)
+            {
+                try { handler.CatchType = origModule.ImportReference(handler.CatchType); }
+                catch { }
+            }
+
+        for (int i = 0; i < newBody.Instructions.Count; i++)
+        {
+            var instr = newBody.Instructions[i];
+            var operand = instr.Operand;
+
+            try
+            {
+                if (operand is FieldReference fieldRef)
+                    instr.Operand = origModule.ImportReference(fieldRef);
+                else if (operand is MethodReference methodRef)
+                    instr.Operand = origModule.ImportReference(methodRef);
+                else if (operand is TypeReference typeRef && typeRef is not GenericParameter)
+                    instr.Operand = origModule.ImportReference(typeRef);
+            }
+            catch { }
+        }
+
+        origMoveNext.Body = newBody;
+
+        // Write the entire original module (with only MoveNext replaced)
+        origModule.Write(stream);
+    }
+
+    // NOTE: CloneTypeWithNestedTypes and RelinkMethodBody were removed — the async path
+    // now mutates the original module in-place (WriteAsyncAssembly), making deep-clone unnecessary.
+
+    /// <summary>
+    /// Scans the emitted method body for references to methods whose declaring types
+    /// are not defined in the current module. For each such type, creates a stub type
+    /// with stub methods so that the decompiler (with AnonymousMethods enabled) can
+    /// resolve delegate targets without crashing.
+    /// </summary>
+    private static void CreateReferencedNestedTypeStubs(TypeDefinition parentType)
+    {
+        var module = parentType.Module;
+        var method = parentType.Methods.FirstOrDefault();
+        if (method?.Body == null) return;
+
+        // Collect all referenced method/type pairs not defined in this module
+        var referencedMethods = new Dictionary<string, List<MethodReference>>();
+
+        foreach (var instr in method.Body.Instructions)
+        {
+            if (instr.Operand is MethodReference methodRef)
+            {
+                var declType = methodRef.DeclaringType;
+                if (declType == null) continue;
+
+                // Skip types already in the module, and skip the parent type itself
+                var fullName = declType.FullName;
+                if (fullName == parentType.FullName) continue;
+
+                // Only stub compiler-generated types (display classes, state machines, etc.)
+                // These typically contain '<' or start with '<>'
+                var typeName = declType.Name;
+                if (!typeName.Contains('<') && !typeName.Contains('>') && !typeName.StartsWith("$")) continue;
+
+                if (!referencedMethods.ContainsKey(fullName))
+                    referencedMethods[fullName] = new List<MethodReference>();
+                referencedMethods[fullName].Add(methodRef);
+            }
+        }
+
+        foreach (var (typeFullName, methods) in referencedMethods)
+        {
+            // Check if a type with this name already exists
+            var sample = methods[0].DeclaringType;
+            var stubTypeName = sample.Name;
+
+            if (module.Types.Any(t => t.FullName == typeFullName))
+                continue;
+            if (parentType.NestedTypes.Any(t => t.Name == stubTypeName))
+                continue;
+
+            var stubType = new TypeDefinition(
+                sample.Namespace,
+                stubTypeName,
+                Mono.Cecil.TypeAttributes.NestedPrivate | Mono.Cecil.TypeAttributes.Sealed | Mono.Cecil.TypeAttributes.Class
+            )
+            {
+                BaseType = module.TypeSystem.Object
+            };
+
+            // Add stub fields referenced from method body
+            var referencedFields = new HashSet<string>();
+            foreach (var instr in method.Body.Instructions)
+            {
+                if (instr.Operand is FieldReference fieldRef &&
+                    fieldRef.DeclaringType?.FullName == typeFullName &&
+                    referencedFields.Add(fieldRef.Name))
+                {
+                    var fieldType = module.ImportReference(fieldRef.FieldType);
+                    stubType.Fields.Add(new FieldDefinition(fieldRef.Name, Mono.Cecil.FieldAttributes.Public, fieldType));
+                }
+            }
+
+            // Add stub methods
+            var addedMethods = new HashSet<string>();
+            foreach (var methodRef in methods)
+            {
+                var sig = methodRef.FullName;
+                if (!addedMethods.Add(sig)) continue;
+
+                var stubMethod = new MethodDefinition(
+                    methodRef.Name,
+                    Mono.Cecil.MethodAttributes.Public | Mono.Cecil.MethodAttributes.HideBySig,
+                    module.ImportReference(methodRef.ReturnType)
+                );
+
+                if (methodRef.Name == ".ctor")
+                {
+                    stubMethod.Attributes = Mono.Cecil.MethodAttributes.Public |
+                                            Mono.Cecil.MethodAttributes.HideBySig |
+                                            Mono.Cecil.MethodAttributes.SpecialName |
+                                            Mono.Cecil.MethodAttributes.RTSpecialName;
+                }
+
+                foreach (var param in methodRef.Parameters)
+                {
+                    stubMethod.Parameters.Add(new ParameterDefinition(
+                        param.Name,
+                        param.Attributes,
+                        module.ImportReference(param.ParameterType)
+                    ));
+                }
+
+                // Minimal body: just throw or return default
+                stubMethod.Body = new Mono.Cecil.Cil.MethodBody(stubMethod);
+                var ilProc = stubMethod.Body.GetILProcessor();
+                if (methodRef.ReturnType.FullName == "System.Void")
+                {
+                    ilProc.Append(ilProc.Create(Mono.Cecil.Cil.OpCodes.Ret));
+                }
+                else
+                {
+                    ilProc.Append(ilProc.Create(Mono.Cecil.Cil.OpCodes.Ldnull));
+                    ilProc.Append(ilProc.Create(Mono.Cecil.Cil.OpCodes.Throw));
+                }
+
+                stubType.Methods.Add(stubMethod);
+            }
+
+            parentType.NestedTypes.Add(stubType);
+
+            // Now relink instructions to point to the stub definitions instead of external references
+            foreach (var instr in method.Body.Instructions)
+            {
+                if (instr.Operand is MethodReference methodRef &&
+                    methodRef.DeclaringType?.FullName == typeFullName)
+                {
+                    var stubMethod = stubType.Methods.FirstOrDefault(m => m.FullName == methodRef.FullName);
+                    if (stubMethod != null)
+                        instr.Operand = stubMethod;
+                }
+                else if (instr.Operand is FieldReference fieldRef &&
+                         fieldRef.DeclaringType?.FullName == typeFullName)
+                {
+                    var stubField = stubType.Fields.FirstOrDefault(f => f.Name == fieldRef.Name);
+                    if (stubField != null)
+                        instr.Operand = stubField;
+                }
+            }
+        }
     }
 
     static readonly Dictionary<OpCode, OpCode> ShortToLongBranch = new()

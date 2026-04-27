@@ -79,8 +79,9 @@ class RemodderToolWindowFactory : ToolWindowFactory {
             project.solution.remodderProtocolModel.decompile.start(arrayOf(filePath, typeName) + userAssemblies).toPromise().then {
                 thisLogger().info("Decompile RPC returned ${it.size} strings")
                 if (it.size == 1) {
-                    statusLabel.text = "$typeName: ${it[0]}"
-                    errorDetails.isVisible = false
+                    errorMsg = it[0]
+                    statusLabel.text = "$typeName: ERROR"
+                    errorDetails.isVisible = true
                     return@then
                 }
 
